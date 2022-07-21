@@ -200,6 +200,8 @@
 
 #include "drm_internal.h"
 
+#include <sys/systm.h>
+
 struct syncobj_wait_entry {
 	struct list_head node;
 #ifdef __linux__
@@ -249,16 +251,20 @@ static void drm_syncobj_fence_add_wait(struct drm_syncobj *syncobj,
 	if (wait->fence)
 		return;
 
+	printf("%s:%d: spinlock\n", __FUNCTION__, __LINE__);
 	spin_lock(&syncobj->lock);
 	/* We've already tried once to get a fence and failed.  Now that we
 	 * have the lock, try one more time just to be sure we don't add a
 	 * callback when a fence has already been set.
 	 */
+	printf("%s:%d: dma_fence_get\n", __FUNCTION__, __LINE__);	
 	fence = dma_fence_get(rcu_dereference_protected(syncobj->fence, 1));
 	if (!fence || dma_fence_chain_find_seqno(&fence, wait->point)) {
+	  	printf("%s:%d: dma_fence_put\n", __FUNCTION__, __LINE__);
 		dma_fence_put(fence);
 		list_add_tail(&wait->node, &syncobj->cb_list);
 	} else if (!fence) {
+	  	printf("%s:%d: dma_fence_get_stub\n", __FUNCTION__, __LINE__);
 		wait->fence = dma_fence_get_stub();
 	} else {
 		wait->fence = fence;
@@ -1066,6 +1072,7 @@ static signed long drm_syncobj_array_wait_timeout(struct drm_syncobj **syncobjs,
 	 * returning -EINVAL again.
 	 */
 	signaled_count = 0;
+
 	for (i = 0; i < count; ++i) {
 		struct dma_fence *fence;
 
@@ -1110,13 +1117,17 @@ static signed long drm_syncobj_array_wait_timeout(struct drm_syncobj **syncobjs,
 	 * called.  So here if we fail to match signaled_count, we need to
 	 * fallthough and try a 0 timeout wait!
 	 */
-
+	printf("%s:%d: fence add wait\n", __FUNCTION__, __LINE__);
+	
 	if (flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT) {
-		for (i = 0; i < count; ++i)
+		for (i = 0; i < count; ++i) {
+			printf("%s:%d\n", __FUNCTION__, __LINE__);
 			drm_syncobj_fence_add_wait(syncobjs[i], &entries[i]);
+		}
 	}
 
 	do {
+		printf("%s:%d: set interruptible\n", __FUNCTION__, __LINE__);
 		set_current_state(TASK_INTERRUPTIBLE);
 
 		signaled_count = 0;
@@ -1125,6 +1136,7 @@ static signed long drm_syncobj_array_wait_timeout(struct drm_syncobj **syncobjs,
 			if (!fence)
 				continue;
 
+			printf("%s:%d: check\n", __FUNCTION__, __LINE__);
 			if ((flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE) ||
 			    dma_fence_is_signaled(fence) ||
 			    (!entries[i].fence_cb.func &&
@@ -1132,6 +1144,7 @@ static signed long drm_syncobj_array_wait_timeout(struct drm_syncobj **syncobjs,
 						    &entries[i].fence_cb,
 						    syncobj_wait_fence_func))) {
 				/* The fence has been signaled */
+				printf("%s:%d: fence signalled?\n", __FUNCTION__, __LINE__);
 				if (flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL) {
 					signaled_count++;
 				} else {
@@ -1140,8 +1153,10 @@ static signed long drm_syncobj_array_wait_timeout(struct drm_syncobj **syncobjs,
 					goto done_waiting;
 				}
 			}
+			printf("%s:%d: check done\n", __FUNCTION__, __LINE__);
 		}
 
+		printf("%s:%d: done?\n", __FUNCTION__, __LINE__);
 		if (signaled_count == count)
 			goto done_waiting;
 
@@ -1155,25 +1170,34 @@ static signed long drm_syncobj_array_wait_timeout(struct drm_syncobj **syncobjs,
 			goto done_waiting;
 		}
 
+		printf("%s:%d: schedule timeout %ld\n", __FUNCTION__, __LINE__, timeout);
 		timeout = schedule_timeout(timeout);
 	} while (1);
 
 done_waiting:
+	printf("%s:%d: set running\n", __FUNCTION__, __LINE__);
 	__set_current_state(TASK_RUNNING);
 
 cleanup_entries:
+	printf("%s:%d cleanup\n", __FUNCTION__, __LINE__);
 	for (i = 0; i < count; ++i) {
 		drm_syncobj_remove_wait(syncobjs[i], &entries[i]);
-		if (entries[i].fence_cb.func)
+		printf("%s:%d [%d/%d] removed wait\n", __FUNCTION__, __LINE__, i, count);
+		if (entries[i].fence_cb.func) {
+			printf("%s:%d [%d/%d] callback\n", __FUNCTION__, __LINE__, i, count);
 			dma_fence_remove_callback(entries[i].fence,
 						  &entries[i].fence_cb);
+		}
+		printf("%s:%d put fence\n", __FUNCTION__, __LINE__);
 		dma_fence_put(entries[i].fence);
 	}
+	printf("%s:%d cleanup done\n", __FUNCTION__, __LINE__);
 	kfree(entries);
 
 err_free_points:
 	kfree(points);
 
+	printf("%s:%d return\n", __FUNCTION__, __LINE__);
 	return timeout;
 }
 
@@ -1220,7 +1244,15 @@ static int drm_syncobj_array_wait(struct drm_device *dev,
 	uint32_t first = ~0;
 
 	if (!timeline) {
+		// forcing finite timeout results in Xorg showing a black screen with a cursor, but it still hangs.
+		// dmseg shows: Asynchronous wait on fence :Xorg[3264]:2 timeout out (hint: 0xffffffff81437730s)
+		// the server can be killed and releases all inputs, contrary to infinite timeout, when pkill -9 X results in hard lockup
+		// if (wait->timeout_nsec == 9223372036854775807) { // override infinite timeout coming from ioctl
+		//	timeout = drm_timeout_abs_to_jiffies(1000*1000*1000);
+		// } else {
 		timeout = drm_timeout_abs_to_jiffies(wait->timeout_nsec);
+		// }
+		printf("%s:%d: timeline: %ld jiffies from %lld ns\n", __FUNCTION__, __LINE__, timeout, wait->timeout_nsec);
 		timeout = drm_syncobj_array_wait_timeout(syncobjs,
 							 NULL,
 							 wait->count_handles,
@@ -1231,6 +1263,7 @@ static int drm_syncobj_array_wait(struct drm_device *dev,
 		wait->first_signaled = first;
 	} else {
 		timeout = drm_timeout_abs_to_jiffies(timeline_wait->timeout_nsec);
+		printf("%s:%d: timeline: %ld jiffies from %lld ns\n", __FUNCTION__, __LINE__, timeout, timeline_wait->timeout_nsec);
 		timeout = drm_syncobj_array_wait_timeout(syncobjs,
 							 u64_to_user_ptr(timeline_wait->points),
 							 timeline_wait->count_handles,
@@ -1304,6 +1337,7 @@ int
 drm_syncobj_wait_ioctl(struct drm_device *dev, void *data,
 		       struct drm_file *file_private)
 {
+        printf("drm_syncobj_wait_ioctl(): %s:%d\n", __FILE__, __LINE__);
 	struct drm_syncobj_wait *args = data;
 	struct drm_syncobj **syncobjs;
 	int ret = 0;
@@ -1325,6 +1359,8 @@ drm_syncobj_wait_ioctl(struct drm_device *dev, void *data,
 	if (ret < 0)
 		return ret;
 
+
+	printf("drm_syncobj_wait_ioctl(): %s:%d: array wait\n", __FILE__, __LINE__);
 	ret = drm_syncobj_array_wait(dev, file_private,
 				     args, NULL, syncobjs, false);
 
